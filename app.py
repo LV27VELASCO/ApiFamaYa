@@ -11,9 +11,11 @@ import stripe
 from google import genai
 from google.genai import types
 from supabase import create_client, Client
-from models import Response, Items, ServicesCheckOut
+from models import Response, Items
 from flask_limiter import Limiter
 from flask_limiter.util import get_remote_address
+from datetime import datetime
+import locale
 
 
 load_dotenv()
@@ -58,7 +60,6 @@ def generar_token():
     access_token = create_access_token(identity=session_id)
     return jsonify(Response(message=access_token).model_dump()),200
 
-
 @app.route('/api/services/<slug>', methods=['GET'])
 @jwt_required(locations=['headers'])
 def services(slug):
@@ -82,7 +83,6 @@ def services(slug):
         statusCode = 500
         response = Response(message=str(e))
         return jsonify(response.model_dump()), statusCode
-    
 
 @app.route('/api/all-services', methods=['GET'])
 @jwt_required(locations=['headers'])
@@ -115,17 +115,66 @@ def get_orders():
     session_id = request.args.get('session_id')
     if not session_id:
         return jsonify(Response(message='Session_id requerido').model_dump()), 400
-
     try:
         response = supabase.table("orders_success")\
-            .select("order")\
+            .select("code_order, order")\
             .eq("session_id", session_id)\
             .execute()
         
         if not response.data:
             return jsonify(Response(message='Orden no encontrada').model_dump()), 404
-        orders_data = [row["order"] for row in response.data]
-        return jsonify(orders_data[0]), statusCode
+        
+        return jsonify(response.data), statusCode
+    except ValidationError as e:
+        statusCode = 400
+        response = Response(message=str(e))
+        return jsonify(response.model_dump()), statusCode
+    except Exception as e:
+        statusCode = 500
+        response = Response(message=str(e))
+        return jsonify(response.model_dump()), statusCode
+
+@app.route('/api/consult-order', methods=['GET'])
+@jwt_required(locations=['headers'])
+def consult_order():
+    statusCode = 200
+    code_order = request.args.get('code_order')
+    if not code_order:
+        return jsonify(Response(message='Codigo de orden requerido').model_dump()), 400
+    try:
+        response_table = supabase.table("orders_success")\
+            .select("code_order, order")\
+            .eq("code_order", code_order)\
+            .execute()
+        
+        if not response_table.data:
+            return jsonify(Response(message='Orden no encontrada').model_dump()), 404
+        
+        response = consult_order_justanother(code_order)
+        status = response.get("status")
+        remains = response.get("remains")
+        start_count = response.get("start_count")
+
+        # Extraer la primera fila de la tabla
+        row = response_table.data[0]
+
+        # Extraer los datos de la columna "order" (primer objeto de la lista)
+        order_data = row["order"]
+
+        # Construir el objeto final
+        result = {
+            "code_order":row["code_order"],
+            "status": status,
+            "remains": remains,
+            "start_count": start_count,
+            "slug": order_data["slug"],
+            "price": order_data["price"],
+            "quantity": order_data["quantity"],
+            "url": order_data["url"],
+            "date":order_data["date"]
+        }
+
+        return jsonify(result), statusCode
     except ValidationError as e:
         statusCode = 400
         response = Response(message=str(e))
@@ -175,12 +224,11 @@ def create_checkout_session():
             ],
             metadata={"orders": json.dumps(payload)},
             success_url='http://localhost:4200/success?session_id={CHECKOUT_SESSION_ID}',
-            cancel_url='https://tuweb.com/cancel',
+            cancel_url='http://localhost:4200/cancel',
         )
         return jsonify(session), 200
     except Exception as e:
         return jsonify(error=str(e)), 400
-
 
 @app.route('/webhook', methods=['POST'])
 def stripe_webhook():
@@ -204,8 +252,18 @@ def stripe_webhook():
         # Recuperar carrito desde metadata
         orders = json.loads(session["metadata"]["orders"])
         if orders:
+
+            # Establecer el locale a español (para que los meses salgan en español)
+            locale.setlocale(locale.LC_TIME, "es_ES.UTF-8")  # En Windows podría ser "Spanish_Spain.1252"
+
+            # Fecha actual
+            fecha = datetime.now()
+
+            # Formatear fecha: día de mes en texto, año
+            fecha_formateada = fecha.strftime("%d de %B, %Y")
+
+
             # Procesar cada ítem del carrito
-            orders_data=[]
             for order in orders:
                 slug = order.get('slug')
                 url = order.get('url')
@@ -213,9 +271,9 @@ def stripe_webhook():
                 price = order.get('price')
                 # Aquí llamas a tu API interna de entrega
                 order_id = entregar_producto(slug, url, quantity)
-                orders_data.append({ "slug": slug, "url": url, "quantity": quantity,"price": price ,"order_id": order_id})
-            
-            insert_data(session_id,orders_data)
+                order_data = { "slug": slug, "url": url, "quantity": quantity,"price": price, "date":fecha_formateada}
+                insert_data(session_id, order_id, order_data)
+
     return 'OK', 200
 
 def entregar_producto(slug, url, cantidad):
@@ -284,7 +342,7 @@ def send_order(code_service:str, link:str, quantity:str):
     except requests.exceptions.RequestException as e:
         return ""
 
-def consult_order(code_order:str):
+def consult_order_justanother(code_order:str):
     JUSTANOTHER_URL = os.environ.get("JUSTANOTHER_URL")
     JUSTANOTHER_KEY = os.environ.get("JUSTANOTHER_KEY")
     try:
@@ -301,9 +359,7 @@ def consult_order(code_order:str):
         response = requests.post(JUSTANOTHER_URL,data=payload, headers=headers)
         response.raise_for_status()  # lanza error si status no es 2xx
         data = response.json()
-        print("estado_orden",data)
-        order_id = data.get("order")
-        return order_id
+        return data
     except requests.exceptions.RequestException as e:
         return ""
 
@@ -321,8 +377,8 @@ def validate_services(slug:str, id_price:str, url:str):
 
     return response
 
-def insert_data(session_id:str, order:str):
-    response = (supabase.table("orders_success").insert([{"session_id": session_id, "order": order}]).execute())
+def insert_data(session_id:str, order_id:int, order:str):
+    response = (supabase.table("orders_success").insert([{"session_id": session_id, "code_order":order_id, "order": order}]).execute())
 
 if __name__ == "__main__":
     print("Servidor iniciado en http://localhost:2000")
