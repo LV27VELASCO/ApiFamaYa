@@ -109,7 +109,7 @@ def allservices():
         return jsonify(response.model_dump()), statusCode
     
 @app.route('/api/get-orders', methods=['GET'])
-#@jwt_required(locations=['headers'])
+@jwt_required(locations=['headers'])
 def get_orders():
     statusCode = 200
     session_id = request.args.get('session_id')
