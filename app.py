@@ -46,7 +46,7 @@ CORS(app, origins=["http://localhost:4200", "http://127.0.0.1:5500", "https://fa
 
 #FOLLOWERS, LIKES, VIEWS
 CODE_SERVICE = {
-            "instagram": ["5712","4365","556"],    # Reemplaza con tu clave real
+            "instagram": ["5712","4365","556"],
             "facebook": ["1636","1101","9598"],
             "tiktok": ["8521","2079","6990"]
         }
@@ -108,7 +108,32 @@ def allservices():
         response = Response(message=str(e))
         return jsonify(response.model_dump()), statusCode
     
+@app.route('/api/get-orders', methods=['GET'])
+#@jwt_required(locations=['headers'])
+def get_orders():
+    statusCode = 200
+    session_id = request.args.get('session_id')
+    if not session_id:
+        return jsonify(Response(message='Session_id requerido').model_dump()), 400
 
+    try:
+        response = supabase.table("orders_success")\
+            .select("order")\
+            .eq("session_id", session_id)\
+            .execute()
+        
+        if not response.data:
+            return jsonify(Response(message='Orden no encontrada').model_dump()), 404
+        orders_data = [row["order"] for row in response.data]
+        return jsonify(orders_data[0]), statusCode
+    except ValidationError as e:
+        statusCode = 400
+        response = Response(message=str(e))
+        return jsonify(response.model_dump()), statusCode
+    except Exception as e:
+        statusCode = 500
+        response = Response(message=str(e))
+        return jsonify(response.model_dump()), statusCode
 
 @app.route('/api/checkout-session', methods=['POST'])
 #@jwt_required(locations=['headers'])
@@ -118,7 +143,7 @@ def create_checkout_session():
     try:
         products =[]
         for item in data.items:
-           product = validarServicios(item.slug, item.id,item.url)
+           product = validate_services(item.slug, item.id,item.url)
            if product:
                 products.append(product[0])
 
@@ -149,7 +174,7 @@ def create_checkout_session():
                 } for item in products
             ],
             metadata={"orders": json.dumps(payload)},
-            success_url='https://tuweb.com/success',
+            success_url='http://localhost:4200/success?session_id={CHECKOUT_SESSION_ID}',
             cancel_url='https://tuweb.com/cancel',
         )
         return jsonify(session), 200
@@ -163,7 +188,7 @@ def stripe_webhook():
     sig_header = request.headers.get('stripe-signature')
     webhook_secret = os.environ.get('SECRET_WEBHOOK')
     event = None
-
+    
     try:
         event = stripe.Webhook.construct_event(
             payload, sig_header, webhook_secret
@@ -175,30 +200,35 @@ def stripe_webhook():
     if event['type'] == 'checkout.session.completed':
         session = event['data']['object']
         session_id = session.get('id')
-
+        
         # Recuperar carrito desde metadata
         orders = json.loads(session["metadata"]["orders"])
         if orders:
             # Procesar cada ítem del carrito
+            orders_data=[]
             for order in orders:
                 slug = order.get('slug')
                 url = order.get('url')
                 quantity = order.get('quantity')
+                price = order.get('price')
                 # Aquí llamas a tu API interna de entrega
-                entregar_producto(slug, url, quantity)
-
-
+                order_id = entregar_producto(slug, url, quantity)
+                orders_data.append({ "slug": slug, "url": url, "quantity": quantity,"price": price ,"order_id": order_id})
+            
+            insert_data(session_id,orders_data)
     return 'OK', 200
 
 def entregar_producto(slug, url, cantidad):
-     order_id:str
-     if "instagram-followers" or "instagram-likes" or "instagram-views" in slug:
-         order_id = service_instagram(slug, url, cantidad)
-     elif "tiktok-followers" or "tiktok-likes" or "tiktok-views" in slug:
-         order_id = service_tiktok(slug, url, cantidad)
-     elif "facebook-followers" or "facebook-likes" or "facebook-views" in slug:
-         order_id = service_facebook(slug, url, cantidad)
-     
+    order_id = None  # evitar UnboundLocalError
+
+    if any(x in slug for x in ["instagram-followers", "instagram-likes", "instagram-views"]):
+        order_id = service_instagram(slug, url, cantidad)
+    elif any(x in slug for x in ["tiktok-followers", "tiktok-likes", "tiktok-views"]):
+        order_id = service_tiktok(slug, url, cantidad)
+    elif any(x in slug for x in ["facebook-followers", "facebook-likes", "facebook-views"]):
+        order_id = service_facebook(slug, url, cantidad)
+
+    return order_id
 
 def service_instagram(slug, url, cantidad):
     order_id:str
@@ -208,6 +238,7 @@ def service_instagram(slug, url, cantidad):
          order_id = send_order(CODE_SERVICE["instagram"][1], url, cantidad)
     elif "instagram-views" in slug:
          order_id = send_order(CODE_SERVICE["instagram"][2], url, cantidad)
+    return order_id
 
 def service_tiktok(slug, url, cantidad):
     order_id:str
@@ -217,6 +248,7 @@ def service_tiktok(slug, url, cantidad):
          order_id = send_order(CODE_SERVICE["tiktok"][1], url, cantidad)
     elif "tiktok-views" in slug:
          order_id = send_order(CODE_SERVICE["tiktok"][2], url, cantidad)
+    return order_id
 
 def service_facebook(slug, url, cantidad):
     order_id:str
@@ -226,8 +258,9 @@ def service_facebook(slug, url, cantidad):
          order_id = send_order(CODE_SERVICE["facebook"][1], url, cantidad)
     elif "facebook-views" in slug:
          order_id = send_order(CODE_SERVICE["facebook"][2], url, cantidad)
+    return order_id
 
-def send_order(code_service:str, quantity:str, link:str):
+def send_order(code_service:str, link:str, quantity:str):
     JUSTANOTHER_URL = os.environ.get("JUSTANOTHER_URL")
     JUSTANOTHER_KEY = os.environ.get("JUSTANOTHER_KEY")
     try:
@@ -251,9 +284,30 @@ def send_order(code_service:str, quantity:str, link:str):
     except requests.exceptions.RequestException as e:
         return ""
 
+def consult_order(code_order:str):
+    JUSTANOTHER_URL = os.environ.get("JUSTANOTHER_URL")
+    JUSTANOTHER_KEY = os.environ.get("JUSTANOTHER_KEY")
+    try:
+        payload = {
+            "key": JUSTANOTHER_KEY,    # Reemplaza con tu clave real
+            "action": "status",
+            "order": code_order
+        }
 
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
 
-def validarServicios(slug:str, id_price:str, url:str):
+        response = requests.post(JUSTANOTHER_URL,data=payload, headers=headers)
+        response.raise_for_status()  # lanza error si status no es 2xx
+        data = response.json()
+        print("estado_orden",data)
+        order_id = data.get("order")
+        return order_id
+    except requests.exceptions.RequestException as e:
+        return ""
+
+def validate_services(slug:str, id_price:str, url:str):
     consult = supabase.table("prices")\
     .select("id_price, quantity, bonus, price, service:services(id_service, name, slug)")\
     .eq("id_price", id_price.strip())\
@@ -267,13 +321,8 @@ def validarServicios(slug:str, id_price:str, url:str):
 
     return response
 
-def insertData():
-    response = (supabase.table("characters").insert([
-            {"id": 1, "name": "Frodo"},
-            {"id": 2, "name": "Sam"},
-        ]).execute()
-    )
-
+def insert_data(session_id:str, order:str):
+    response = (supabase.table("orders_success").insert([{"session_id": session_id, "order": order}]).execute())
 
 if __name__ == "__main__":
     print("Servidor iniciado en http://localhost:2000")
